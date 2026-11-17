@@ -5,6 +5,8 @@ from email.headerregistry import Address
 from email.utils import format_datetime
 from email.policy import SMTP
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 os.umask(0o077)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -17,6 +19,9 @@ def db_open(path):
     db=sqlite3.connect(path)
     db.execute('CREATE TABLE IF NOT EXISTS snapshots (hash TEXT PRIMARY KEY, chat TEXT NOT NULL, payload TEXT NOT NULL, captured TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS messages (chat TEXT, id TEXT, meta TEXT, payload TEXT, PRIMARY KEY(chat,id))')
+    db.execute('CREATE TABLE IF NOT EXISTS chat_state (chat TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, checked REAL NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS attachments (chat TEXT, message TEXT, position INTEGER, metadata TEXT NOT NULL, hash TEXT, PRIMARY KEY(chat,message,position))')
+    db.commit()
     return db
 
 def save(db,c,messages):
@@ -37,24 +42,88 @@ def save(db,c,messages):
                 db.execute('UPDATE messages SET meta=?,payload=? WHERE chat=? AND id=?',(args[2],args[3],cid,str(mid)))
     return added,existing,missing
 
-def backup(db):
-    from kleinanzeigen_api import KleinanzeigenAPI, Authenticator
-    auth=Authenticator()
-    if not auth.logged_in: raise RuntimeError('Login required')
-    api=KleinanzeigenAPI(authenticator=auth)
-    count=added=existing=missing=0
+def fingerprint(c):
+    raw=c.get('raw') or {}
+    latest=raw.get('unichatLatestMessage')
+    if not latest or not raw.get('receivedDate'): return None
+    return digest(dump([latest,raw.get('receivedDate'),raw.get('textShortTrimmed'),c.get('ad_title'),raw.get('adStatus')]))
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs): return None
+
+def download_attachment(url,folder):
+    parsed=urlsplit(url)
+    host=parsed.hostname or ''
+    if parsed.scheme!='https' or parsed.username or parsed.password or parsed.port not in (None,443) or not (host=='kleinanzeigen.de' or host.endswith('.kleinanzeigen.de')):
+        raise ValueError('Unsupported attachment host')
+    folder.mkdir(parents=True,exist_ok=True)
+    limit=50*1024*1024
+    import tempfile
+    tmp=None
+    try:
+        with build_opener(NoRedirect()).open(Request(url,headers={'Accept-Encoding':'identity'}),timeout=30) as response, tempfile.NamedTemporaryFile(dir=folder,delete=False) as f:
+            tmp=Path(f.name); h=hashlib.sha256(); size=0
+            if response.headers.get('Content-Type','').lower().startswith('text/html'): raise ValueError('HTML response')
+            while chunk:=response.read(65536):
+                size+=len(chunk)
+                if size>limit: raise ValueError('Attachment too large')
+                h.update(chunk); f.write(chunk)
+            if not size: raise ValueError('Empty attachment')
+            expected=response.headers.get('Content-Length')
+            if expected is not None and int(expected)!=size: raise ValueError('Incomplete attachment')
+        key=h.hexdigest(); dest=folder/key
+        if not dest.exists() or hashlib.sha256(dest.read_bytes()).hexdigest()!=key: tmp.replace(dest)
+        return key
+    finally:
+        if tmp is not None: tmp.unlink(missing_ok=True)
+
+def archive_attachments(db,cid,messages,folder):
+    for m in messages:
+        raw=m.get('raw') or {}; mid=raw.get('messageId')
+        if mid is None: continue
+        for i,item in enumerate(raw.get('attachments') or []):
+            meta=dump(item)
+            old=db.execute('SELECT metadata,hash FROM attachments WHERE chat=? AND message=? AND position=?',(cid,str(mid),i)).fetchone()
+            if old and old[0]==meta and old[1] and (folder/old[1]).is_file(): continue
+            key=None
+            url=first(item,'imageURL','imageUrl','downloadUrl','url') if isinstance(item,dict) else None
+            if isinstance(url,str) and os.getenv('DOWNLOAD_ATTACHMENTS','yes')=='yes':
+                try: key=download_attachment(url,folder)
+                except Exception as e: logging.warning('Attachment not downloaded (%s)',type(e).__name__)
+                time.sleep(2)
+            with db:
+                db.execute('INSERT OR REPLACE INTO attachments VALUES (?,?,?,?,?)',(cid,str(mid),i,meta,key))
+
+def backup(db,api=None,folder=Path('/data/attachments')):
+    if api is None:
+        from kleinanzeigen_api import KleinanzeigenAPI, Authenticator
+        auth=Authenticator()
+        if not auth.logged_in: raise RuntimeError('Login required')
+        api=KleinanzeigenAPI(authenticator=auth)
+    count=added=existing=missing=skipped=0
+    period=max(3600,int(os.getenv('FULL_SCAN_SECONDS','86400')))
     for c in api.conversations():
-        c=asdict(c)
+        c=asdict(c); cid=str(c['id']); count+=1
+        fp=fingerprint(c); now=time.time()
+        state=db.execute('SELECT fingerprint,checked FROM chat_state WHERE chat=?',(cid,)).fetchone()
+        if fp and state and fp==state[0] and 0 <= now-state[1]<period:
+            skipped+=1; continue
         try:
-            messages=[asdict(m) for m in api.messages(c['id'])]
+            messages=[asdict(m) for m in api.messages(cid)]
             a,e,m=save(db,c,messages)
+            archive_attachments(db,cid,messages,folder)
+            if fp:
+                with db: db.execute('INSERT OR REPLACE INTO chat_state VALUES (?,?,?)',(cid,fp,now))
         except Exception:
-            logging.error('Failed while processing conversation #%d',count+1)
+            logging.error('Failed while processing conversation #%d',count)
             raise
-        count+=1; added+=a; existing+=e; missing+=m
+        added+=a; existing+=e; missing+=m
         logging.info('Conversation %d: %d new, %d existing, %d without ID (snapshot only)',count,a,e,m)
         time.sleep(2)
-    logging.info('Backup complete: %d conversations, %d new, %d existing, %d without ID',count,added,existing,missing)
+    logging.info('Backup complete: %d conversations, %d skipped, %d new, %d existing, %d without ID',count,skipped,added,existing,missing)
+    chats,total=db.execute('SELECT count(DISTINCT chat),count(*) FROM messages').fetchone()
+    files,refs,pending=db.execute('SELECT count(DISTINCT hash),count(hash),count(*)-count(hash) FROM attachments').fetchone()
+    logging.info('Archive totals: %d conversations, %d messages, %d unique files, %d attachment references, %d pending',chats,total,files,refs,pending)
 
 def date(m):
     value=first(m,'received_at','sent_at','timestamp','created_at','date')

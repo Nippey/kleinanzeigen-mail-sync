@@ -15,6 +15,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - name: Unit tests
+        run: python3 -m unittest -v
       - name: Image name
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
