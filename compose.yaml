@@ -1,0 +1,16 @@
+services:
+  archive:
+    build: .
+    env_file: /mnt/user/appdata/kleinanzeigen-mail-sync/config.env
+    volumes:
+      - /mnt/user/appdata/kleinanzeigen-mail-sync/data:/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: '99:100'
+    environment:
+      HOME: /data
+      KLEINANZEIGEN_TOKEN_DIR: /data/auth
+    command: [python, /app/archive.py]
