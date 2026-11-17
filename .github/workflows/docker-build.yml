@@ -34,7 +34,7 @@ jobs:
           load: true
           tags: local-test:ci
       - name: Offline smoke test
-        run: docker run --rm --network none local-test:ci python -c 'import archive; from kleinanzeigen_api import KleinanzeigenAPI, Authenticator; db=archive.db_open(":memory:"); archive.save(db,{"conversation_id":"test"},[{"id":"1"}]); assert db.execute("SELECT count(*) FROM messages").fetchone()[0]==1'
+        run: docker run --rm --network none local-test:ci python -c 'import archive; from kleinanzeigen_api import KleinanzeigenAPI, Authenticator; db=archive.db_open(":memory:"); archive.save(db,{"id":"test"},[{"raw":{"messageId":"1"}}]); assert db.execute("SELECT count(*) FROM messages").fetchone()[0]==1'
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
         with:

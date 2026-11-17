@@ -20,25 +20,41 @@ def db_open(path):
     return db
 
 def save(db,c,messages):
-    cid=str(c['conversation_id']); raw=dump({'conversation':c,'messages':messages})
+    cid=str(c['id']); raw=dump({'conversation':c,'messages':messages})
+    added=existing=missing=0
     with db:
         db.execute('INSERT OR IGNORE INTO snapshots VALUES (?,?,?,?)',(digest(raw),cid,raw,datetime.now(timezone.utc).isoformat()))
         for m in messages:
-            mid=first(m,'message_id','id')
-            if mid is not None:
-                db.execute('INSERT INTO messages VALUES (?,?,?,?) ON CONFLICT(chat,id) DO UPDATE SET meta=excluded.meta,payload=excluded.payload',(cid,str(mid),dump(c),dump(m)))
+            mid=first(m.get('raw') or {},'messageId')
+            if mid is None:
+                missing+=1
+                continue
+            args=(cid,str(mid),dump(c),dump(m))
+            cur=db.execute('INSERT OR IGNORE INTO messages VALUES (?,?,?,?)',args)
+            if cur.rowcount: added+=1
+            else:
+                existing+=1
+                db.execute('UPDATE messages SET meta=?,payload=? WHERE chat=? AND id=?',(args[2],args[3],cid,str(mid)))
+    return added,existing,missing
 
 def backup(db):
     from kleinanzeigen_api import KleinanzeigenAPI, Authenticator
     auth=Authenticator()
     if not auth.logged_in: raise RuntimeError('Login required')
     api=KleinanzeigenAPI(authenticator=auth)
-    count=0
+    count=added=existing=missing=0
     for c in api.conversations():
-        c=asdict(c); messages=[asdict(m) for m in api.messages(c['conversation_id'])]
-        save(db,c,messages); count+=1
+        c=asdict(c)
+        try:
+            messages=[asdict(m) for m in api.messages(c['id'])]
+            a,e,m=save(db,c,messages)
+        except Exception:
+            logging.error('Failed while processing conversation #%d',count+1)
+            raise
+        count+=1; added+=a; existing+=e; missing+=m
+        logging.info('Conversation %d: %d new, %d existing, %d without ID (snapshot only)',count,a,e,m)
         time.sleep(2)
-    logging.info('Saved %d conversations returned by API',count)
+    logging.info('Backup complete: %d conversations, %d new, %d existing, %d without ID',count,added,existing,missing)
 
 def date(m):
     value=first(m,'received_at','sent_at','timestamp','created_at','date')
@@ -51,7 +67,8 @@ def message_id(cid,mid): return '<ka-'+digest(cid+'\0'+mid)+'@archive.invalid>'
 def make_mail(cid,mid,c,m,own,root,previous):
     d=date(m); direction=m.get('direction')
     if direction not in ('received','sent'): raise ValueError('Unknown direction')
-    uid=first(c,'counterparty_id','user_id','partner_id')
+    role=c.get('role'); raw=c.get('raw') or {}
+    uid=raw.get('userIdBuyer') if role=='SELLER' else raw.get('userIdSeller') if role=='BUYER' else None
     local=str(uid) if uid is not None else 'chat-'+digest(cid)[:24]
     if not local.isascii() or not local.replace('-','').isalnum(): local=digest(local)
     peer=Address(clean(c.get('counterparty')),local,'kleinanzeigen.invalid')
@@ -95,7 +112,10 @@ def main():
             if mode=='backup': backup(db)
             else: export(db,mode); return
         except Exception as e:
-            logging.error('Operation failed (%s); stopping to avoid repeated access attempts',type(e).__name__)
+            logging.error('Operation failed (%s); stopped to avoid repeated access attempts',type(e).__name__)
+            import traceback
+            for frame in traceback.extract_tb(e.__traceback__):
+                logging.error('Location: %s:%d (%s)',Path(frame.filename).name,frame.lineno,frame.name)
             # Keep container alive without retrying until manually restarted.
             while True: time.sleep(3600)
         time.sleep(interval)
