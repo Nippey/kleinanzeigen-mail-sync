@@ -33,6 +33,8 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
           load: true
           tags: local-test:ci
       - name: Offline smoke test
@@ -48,6 +50,8 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

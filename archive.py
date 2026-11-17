@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 
 os.umask(0o077)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+VERSION = "0.4.2"
+
 def digest(s): return hashlib.sha256(s.encode()).hexdigest()
 def dump(x): return json.dumps(x, ensure_ascii=False, sort_keys=True, default=str)
 def clean(x): return ' '.join(str(x or '').splitlines())
@@ -191,9 +193,15 @@ def export(db,mode):
             (folder/(digest(cid+'\0'+mid)+'.eml')).write_bytes(e.as_bytes()); previous=str(e['Message-ID'])
 
 def main():
+    logging.info('Kleinanzeigen Mail Sync v%s', VERSION)
+    logging.info('Git commit: %s', os.getenv('BUILD_REVISION', 'unknown'))
     mode=os.getenv('MODE','backup'); interval=max(900,int(os.getenv('INTERVAL_SECONDS','3600')))
     if mode not in ('backup','preview','sync') or mode=='sync': raise SystemExit('Unsupported mode: IMAP writes locked')
     if mode=='backup' and os.getenv('ENABLE_LIVE_API')!='yes': raise SystemExit('Live API disabled; review README')
+    logging.info('Mode: %s', mode)
+    logging.info('Sync interval: %d seconds', interval)
+    logging.info('Full scan interval: %d seconds', max(3600,int(os.getenv('FULL_SCAN_SECONDS','86400'))))
+    logging.info('Attachment download: %s', 'enabled' if os.getenv('DOWNLOAD_ATTACHMENTS','yes')=='yes' else 'disabled')
     db=db_open('/data/archive.sqlite3')
     while True:
         try:

@@ -1,4 +1,4 @@
-# Kleinanzeigen Mail Sync — v0.4.1
+# Kleinanzeigen Mail Sync — v0.4.2
 Initial local archive, no IMAP writes. Unofficial API; automated account access may violate terms and lead to suspension. Reading chats may alter read status. Review upstream https://github.com/monkrel/kleinanzeigen-api before enabling. Authentication and sample payload fields were verified on a live account; full backup remains untested. API pagination and actual payload fields need validation; completeness is not guaranteed. Raw snapshots contain the library-returned data, not necessarily full server responses or attachment binaries.
 
 ## Unraid
@@ -27,3 +27,7 @@ After a successful GitHub Actions run: `docker compose pull` then `docker compos
 
 ## v0.4 incremental backup
 Existing database is migrated additively. The first run scans all chats. Later runs skip chats with unchanged latest-message fingerprints until FULL_SCAN_SECONDS (default 86400) has elapsed since their last fetch. Missing fingerprints trigger full fetches. No remote deletes are propagated. Existing configs require no changes. DOWNLOAD_ATTACHMENTS defaults to yes; set no to disable binary downloads. Files are stored by SHA-256 under data/attachments; metadata and links reside in SQLite. Only direct HTTPS kleinanzeigen.de URLs are accepted; redirects, HTML and files over 50 MiB are rejected. Authenticated requests use the library headers only for the exact api.kleinanzeigen.de and gateway.kleinanzeigen.de hosts; redirects are refused. gatewayUrl is preferred, with url as fallback for HTTP errors other than transient server/rate-limit errors. Pending attachments in visible chats are retried on subsequent runs using fresh chat metadata. The two authenticated endpoints were verified on one live JPEG; the integrated downloader has only been tested offline. No IMAP writes.
+
+## Startup diagnostics
+
+Each startup logs the application version, Git commit (injected by CI at build time), mode, effective scan intervals and attachment download setting. Local builds without the build argument show `unknown`. No credentials are logged. Compare the commit with the GitHub Actions run after pulling and recreating the container.
