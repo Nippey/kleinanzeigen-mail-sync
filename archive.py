@@ -6,7 +6,6 @@ from email.utils import format_datetime
 from email.policy import SMTP
 from pathlib import Path
 from urllib.parse import urlsplit
-from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 os.umask(0o077)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -48,36 +47,56 @@ def fingerprint(c):
     if not latest or not raw.get('receivedDate'): return None
     return digest(dump([latest,raw.get('receivedDate'),raw.get('textShortTrimmed'),c.get('ad_title'),raw.get('adStatus')]))
 
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self,*args,**kwargs): return None
+class AttachmentHTTPError(Exception):
+    def __init__(self,status): self.status=status
 
-def download_attachment(url,folder):
+def download_attachment(url,folder,api):
     parsed=urlsplit(url)
     host=parsed.hostname or ''
-    if parsed.scheme!='https' or parsed.username or parsed.password or parsed.port not in (None,443) or not (host=='kleinanzeigen.de' or host.endswith('.kleinanzeigen.de')):
+    if parsed.scheme!='https' or parsed.username is not None or parsed.password is not None or parsed.port not in (None,443) or host not in ('api.kleinanzeigen.de','gateway.kleinanzeigen.de'):
         raise ValueError('Unsupported attachment host')
     folder.mkdir(parents=True,exist_ok=True)
     limit=50*1024*1024
     import tempfile
     tmp=None
     try:
-        with build_opener(NoRedirect()).open(Request(url,headers={'Accept-Encoding':'identity'}),timeout=30) as response, tempfile.NamedTemporaryFile(dir=folder,delete=False) as f:
-            tmp=Path(f.name); h=hashlib.sha256(); size=0
-            if response.headers.get('Content-Type','').lower().startswith('text/html'): raise ValueError('HTML response')
-            while chunk:=response.read(65536):
-                size+=len(chunk)
-                if size>limit: raise ValueError('Attachment too large')
-                h.update(chunk); f.write(chunk)
-            if not size: raise ValueError('Empty attachment')
+        headers=api._headers(authed=True,gateway=host=='gateway.kleinanzeigen.de')
+        headers.update({'Accept':'*/*','Accept-Encoding':'identity'})
+        api._throttle()
+        with api._s.stream('GET',url,headers=headers,allow_redirects=False,timeout=30) as response:
+            api._last=time.time()
+            if response.status_code!=200: raise AttachmentHTTPError(response.status_code)
+            content_type=response.headers.get('Content-Type','').lower().split(';')[0].strip()
+            if content_type in ('text/html','application/json','application/problem+json'): raise ValueError('Unexpected response type')
             expected=response.headers.get('Content-Length')
-            if expected is not None and int(expected)!=size: raise ValueError('Incomplete attachment')
+            if expected is not None and int(expected)>limit: raise ValueError('Attachment too large')
+            with tempfile.NamedTemporaryFile(dir=folder,delete=False) as f:
+                tmp=Path(f.name); h=hashlib.sha256(); size=0
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk: continue
+                    size+=len(chunk)
+                    if size>limit: raise ValueError('Attachment too large')
+                    h.update(chunk); f.write(chunk)
+                if not size: raise ValueError('Empty attachment')
+                if expected is not None and int(expected)!=size: raise ValueError('Incomplete attachment')
         key=h.hexdigest(); dest=folder/key
         if not dest.exists() or hashlib.sha256(dest.read_bytes()).hexdigest()!=key: tmp.replace(dest)
         return key
     finally:
         if tmp is not None: tmp.unlink(missing_ok=True)
 
-def archive_attachments(db,cid,messages,folder):
+def fetch_attachment(item,folder,api):
+    for url in dict.fromkeys(v for k in ('gatewayUrl','url','imageURL','imageUrl','downloadUrl') if isinstance((v:=item.get(k)),str) and v):
+        try: return download_attachment(url,folder,api)
+        except AttachmentHTTPError as e:
+            logging.warning('Attachment not downloaded (HTTP %d)',e.status)
+            if e.status in (429,500,502,503,504): break
+        except Exception as e:
+            logging.warning('Attachment not downloaded (%s)',type(e).__name__)
+            break
+    return None
+
+def archive_attachments(db,cid,messages,folder,api):
     for m in messages:
         raw=m.get('raw') or {}; mid=raw.get('messageId')
         if mid is None: continue
@@ -86,11 +105,10 @@ def archive_attachments(db,cid,messages,folder):
             old=db.execute('SELECT metadata,hash FROM attachments WHERE chat=? AND message=? AND position=?',(cid,str(mid),i)).fetchone()
             if old and old[0]==meta and old[1] and (folder/old[1]).is_file(): continue
             key=None
-            url=first(item,'imageURL','imageUrl','downloadUrl','url') if isinstance(item,dict) else None
-            if isinstance(url,str) and os.getenv('DOWNLOAD_ATTACHMENTS','yes')=='yes':
-                try: key=download_attachment(url,folder)
-                except Exception as e: logging.warning('Attachment not downloaded (%s)',type(e).__name__)
+            if isinstance(item,dict) and os.getenv('DOWNLOAD_ATTACHMENTS','yes')=='yes':
+                key=fetch_attachment(item,folder,api)
                 time.sleep(2)
+            if key is None and old and old[1] and (folder/old[1]).is_file(): key=old[1]
             with db:
                 db.execute('INSERT OR REPLACE INTO attachments VALUES (?,?,?,?,?)',(cid,str(mid),i,meta,key))
 
@@ -106,12 +124,13 @@ def backup(db,api=None,folder=Path('/data/attachments')):
         c=asdict(c); cid=str(c['id']); count+=1
         fp=fingerprint(c); now=time.time()
         state=db.execute('SELECT fingerprint,checked FROM chat_state WHERE chat=?',(cid,)).fetchone()
-        if fp and state and fp==state[0] and 0 <= now-state[1]<period:
+        pending=db.execute('SELECT 1 FROM attachments WHERE chat=? AND hash IS NULL LIMIT 1',(cid,)).fetchone()
+        if fp and state and fp==state[0] and 0 <= now-state[1]<period and not (pending and os.getenv('DOWNLOAD_ATTACHMENTS','yes')=='yes'):
             skipped+=1; continue
         try:
             messages=[asdict(m) for m in api.messages(cid)]
             a,e,m=save(db,c,messages)
-            archive_attachments(db,cid,messages,folder)
+            archive_attachments(db,cid,messages,folder,api)
             if fp:
                 with db: db.execute('INSERT OR REPLACE INTO chat_state VALUES (?,?,?)',(cid,fp,now))
         except Exception:
