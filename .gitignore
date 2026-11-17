@@ -1,0 +1,14 @@
+.env
+*.env
+!config.example.env
+data/
+*.sqlite*
+*.json
+*.eml
+__pycache__/
+
+*.env
+!config.example.env
+*.sqlite3*
+*.eml
+__pycache__/
