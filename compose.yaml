@@ -1,6 +1,6 @@
 services:
   archive:
-    build: .
+    image: ghcr.io/DEIN-GITHUB-NAME/kleinanzeigen-mail-sync:latest
     env_file: /mnt/user/appdata/kleinanzeigen-mail-sync/config.env
     volumes:
       - /mnt/user/appdata/kleinanzeigen-mail-sync/data:/data
